@@ -44,6 +44,7 @@ const char* bypass_name[] = { "BypassTPMCheck", "BypassSecureBootCheck", "Bypass
 int unattend_xml_flags = 0, wintogo_index = -1, wininst_index = 0;
 int unattend_xml_mask = UNATTEND_DEFAULT_SELECTION_MASK;
 char *unattend_xml_path = NULL, unattend_username[MAX_USERNAME_LENGTH];
+BOOL is_bootloader_revoked = FALSE;
 
 extern uint32_t wim_nb_files, wim_proc_files, wim_extra_files;
 
@@ -116,6 +117,7 @@ char* CreateUnattendXml(int arch, int flags)
 			"publicKeyToken=\"31bf3856ad364e35\" versionScope=\"nonSxS\">\n", xml_arch_names[arch]);
 		fprintf(fd, "      <RunSynchronous>\n");
 		// This part was picked from https://github.com/AveYo/MediaCreationTool.bat/blob/main/bypass11/AutoUnattend.xml
+		// NB: This is INCOMPATIBLE with S-Mode below
 		if (flags & UNATTEND_NO_ONLINE_ACCOUNT) {
 			uprintf("• Bypass online account requirement");
 			fprintf(fd, "        <RunSynchronousCommand wcm:action=\"add\">\n");
@@ -206,6 +208,11 @@ char* CreateUnattendXml(int arch, int flags)
 				"publicKeyToken=\"31bf3856ad364e35\" versionScope=\"nonSxS\">\n", xml_arch_names[arch]);
 			fprintf(fd, "      <PreventDeviceEncryption>true</PreventDeviceEncryption>\n");
 			fprintf(fd, "    </component>\n");
+			fprintf(fd, "    <component name=\"Microsoft-Windows-EnhancedStorage-Adm\" processorArchitecture=\"%s\" language=\"neutral\" "
+				"xmlns:wcm=\"http://schemas.microsoft.com/WMIConfig/2002/State\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" "
+				"publicKeyToken=\"31bf3856ad364e35\" versionScope=\"nonSxS\">\n", xml_arch_names[arch]);
+			fprintf(fd, "      <TCGSecurityActivationDisabled>1</TCGSecurityActivationDisabled>\n");
+			fprintf(fd, "    </component>\n");
 		}
 		fprintf(fd, "  </settings>\n");
 	}
@@ -218,6 +225,14 @@ char* CreateUnattendXml(int arch, int flags)
 				"xmlns:wcm=\"http://schemas.microsoft.com/WMIConfig/2002/State\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" "
 				"publicKeyToken=\"31bf3856ad364e35\" versionScope=\"nonSxS\">\n", xml_arch_names[arch]);
 			fprintf(fd, "      <SanPolicy>4</SanPolicy>\n");
+			fprintf(fd, "    </component>\n");
+		}
+		if (flags & UNATTEND_FORCE_S_MODE) {
+			uprintf("• Enforce S Mode");
+			fprintf(fd, "    <component name=\"Microsoft-Windows-CodeIntegrity\" processorArchitecture=\"%s\" language=\"neutral\" "
+				"xmlns:wcm=\"http://schemas.microsoft.com/WMIConfig/2002/State\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" "
+				"publicKeyToken=\"31bf3856ad364e35\" versionScope=\"nonSxS\">\n", xml_arch_names[arch]);
+			fprintf(fd, "      <SkuPolicyRequired>1</SkuPolicyRequired>\n");
 			fprintf(fd, "    </component>\n");
 		}
 		fprintf(fd, "  </settings>\n");
@@ -430,12 +445,12 @@ BOOL PopulateWindowsVersion(void)
 
 	memset(&img_report.win_version, 0, sizeof(img_report.win_version));
 
-	if ((nWindowsVersion < WINDOWS_8) || ((WimExtractCheck(TRUE) & 4) == 0))
+	if ((WindowsVersion.Version < WINDOWS_8) || ((WimExtractCheck(TRUE) & 4) == 0))
 		return FALSE;
 
 	// If we're not using a straight install.wim, we need to mount the ISO to access it
 	if (!img_report.is_windows_img) {
-		mounted_iso = MountISO(image_path);
+		mounted_iso = VhdMountImage(image_path);
 		if (mounted_iso == NULL) {
 			uprintf("Could not mount Windows ISO for build number detection");
 			return FALSE;
@@ -463,9 +478,34 @@ BOOL PopulateWindowsVersion(void)
 out:
 	DeleteFileU(xml_file);
 	if (!img_report.is_windows_img)
-		UnMountISO();
+		VhdUnmountImage();
 
 	return ((img_report.win_version.major != 0) && (img_report.win_version.build != 0));
+}
+
+// Copy this system's SkuSiPolicy.p7b to the target drive so that UEFI bootloaders
+// revoked by Windows through WDAC policy do get flagged as revoked.
+BOOL CopySKUSiPolicy(const char* drive_name)
+{
+	BOOL r = FALSE;
+	char src[MAX_PATH], dst[MAX_PATH];
+	struct __stat64 stat64 = { 0 };
+
+	// Only copy SkuPolicy if we warned about the bootloader being revoked.
+	if ((target_type != TT_UEFI) || !IS_WINDOWS_1X(img_report) ||
+		(pe256ssp_size == 0) || !is_bootloader_revoked)
+		return r;
+
+	static_sprintf(src, "%s\\SecureBootUpdates\\SKUSiPolicy.p7b", system_dir);
+	static_sprintf(dst, "%s\\EFI\\Microsoft\\Boot\\SKUSiPolicy.p7b", drive_name);
+	if ((_stat64U(dst, &stat64) != 0) && (_stat64U(src, &stat64) == 0)) {
+		uprintf("Copying: %s (%s) (from %s)", dst, SizeToHumanReadable(stat64.st_size, FALSE, FALSE), src);
+		r = CopyFileU(src, dst, TRUE);
+		if (!r)
+			uprintf("  Error writing file: %s", WindowsErrorString());
+	}
+
+	return r;
 }
 
 /// <summary>
@@ -486,7 +526,7 @@ int SetWinToGoIndex(void)
 	// Sanity checks
 	wintogo_index = -1;
 	wininst_index = 0;
-	if ((nWindowsVersion < WINDOWS_8) || ((WimExtractCheck(FALSE) & 4) == 0) ||
+	if ((WindowsVersion.Version < WINDOWS_8) || ((WimExtractCheck(FALSE) & 4) == 0) ||
 		(ComboBox_GetCurItemData(hFileSystem) != FS_NTFS)) {
 		return -1;
 	}
@@ -504,7 +544,7 @@ int SetWinToGoIndex(void)
 
 	// If we're not using a straight install.wim, we need to mount the ISO to access it
 	if (!img_report.is_windows_img) {
-		mounted_iso = MountISO(image_path);
+		mounted_iso = VhdMountImage(image_path);
 		if (mounted_iso == NULL) {
 			uprintf("Could not mount ISO for Windows To Go selection");
 			return -1;
@@ -585,7 +625,7 @@ int SetWinToGoIndex(void)
 out:
 	DeleteFileU(xml_file);
 	if (!img_report.is_windows_img)
-		UnMountISO();
+		VhdUnmountImage();
 	return wintogo_index;
 }
 
@@ -606,13 +646,13 @@ BOOL SetupWinToGo(DWORD DriveIndex, const char* drive_name, BOOL use_esp)
 
 	uprintf("Windows To Go mode selected");
 	// Additional sanity checks
-	if ((use_esp) && (SelectedDrive.MediaType != FixedMedia) && (nWindowsBuildNumber < 15000)) {
+	if ((use_esp) && (SelectedDrive.MediaType != FixedMedia) && (WindowsVersion.BuildNumber < 15000)) {
 		FormatStatus = ERROR_SEVERITY_ERROR | FAC(FACILITY_STORAGE) | ERROR_NOT_SUPPORTED;
 		return FALSE;
 	}
 
 	if (!img_report.is_windows_img) {
-		mounted_iso = MountISO(image_path);
+		mounted_iso = VhdMountImage(image_path);
 		if (mounted_iso == NULL) {
 			uprintf("Could not mount ISO for Windows To Go installation");
 			FormatStatus = ERROR_SEVERITY_ERROR | FAC(FACILITY_STORAGE) | APPERR(ERROR_ISO_EXTRACT);
@@ -628,11 +668,11 @@ BOOL SetupWinToGo(DWORD DriveIndex, const char* drive_name, BOOL use_esp)
 		if (!IS_ERROR(FormatStatus))
 			FormatStatus = ERROR_SEVERITY_ERROR | FAC(FACILITY_STORAGE) | APPERR(ERROR_ISO_EXTRACT);
 		if (!img_report.is_windows_img)
-			UnMountISO();
+			VhdUnmountImage();
 		return FALSE;
 	}
 	if (!img_report.is_windows_img)
-		UnMountISO();
+		VhdUnmountImage();
 
 	if (use_esp) {
 		uprintf("Setting up EFI System Partition");
@@ -673,12 +713,16 @@ BOOL SetupWinToGo(DWORD DriveIndex, const char* drive_name, BOOL use_esp)
 	static_sprintf(cmd, "%s\\bcdboot.exe %s\\Windows /v /f %s /s %s", sysnative_dir, drive_name,
 		HAS_BOOTMGR_BIOS(img_report) ? (HAS_BOOTMGR_EFI(img_report) ? "ALL" : "BIOS") : "UEFI",
 		(use_esp) ? ms_efi : drive_name);
+	// I don't believe we can ever have a stray '%' in cmd, but just in case...
+	assert(strchr(cmd, '%') == NULL);
 	uprintf(cmd);
 	if (RunCommand(cmd, sysnative_dir, usb_debug) != 0) {
 		// Try to continue... but report a failure
 		uprintf("Failed to enable boot");
 		FormatStatus = ERROR_SEVERITY_ERROR | FAC(FACILITY_STORAGE) | APPERR(ERROR_ISO_EXTRACT);
 	}
+
+	CopySKUSiPolicy((use_esp) ? ms_efi : drive_name);
 
 	UpdateProgressWithInfo(OP_FILE_COPY, MSG_267, wim_proc_files + 2 * wim_extra_files, wim_nb_files);
 
@@ -698,6 +742,7 @@ BOOL SetupWinToGo(DWORD DriveIndex, const char* drive_name, BOOL use_esp)
 	uprintf("Disabling use of the Windows Recovery Environment using command:");
 	static_sprintf(cmd, "%s\\bcdedit.exe /store %s\\EFI\\Microsoft\\Boot\\BCD /set {default} recoveryenabled no",
 		sysnative_dir, (use_esp) ? ms_efi : drive_name);
+	assert(strchr(cmd, '%') == NULL);
 	uprintf(cmd);
 	RunCommand(cmd, sysnative_dir, usb_debug);
 

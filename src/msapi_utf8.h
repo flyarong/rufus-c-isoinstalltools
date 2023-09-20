@@ -344,23 +344,19 @@ static __inline int DrawTextU(HDC hDC, LPCSTR lpText, int nCount, LPRECT lpRect,
 static __inline int GetWindowTextU(HWND hWnd, char* lpString, int nMaxCount)
 {
 	int ret = 0;
-	DWORD err = ERROR_INVALID_DATA;
-	if (nMaxCount < 0)
-		return 0;
+	DWORD err = ERROR_INVALID_PARAMETER;
+	if (lpString == NULL || nMaxCount < 1)
+		goto out;
 	// Handle the empty string as GetWindowTextW() returns 0 then
-	if ((lpString != NULL) && (nMaxCount > 0))
-		lpString[0] = 0;
-	// coverity[returned_null]
+	lpString[0] = 0;
 	walloc(lpString, nMaxCount);
 	ret = GetWindowTextW(hWnd, wlpString, nMaxCount);
 	err = GetLastError();
-	// coverity[var_deref_model]
-	if ( (ret != 0) && ((ret = wchar_to_utf8_no_alloc(wlpString, lpString, nMaxCount)) == 0) ) {
+	if ((ret != 0) && ((ret = wchar_to_utf8_no_alloc(wlpString, lpString, nMaxCount)) == 0))
 		err = GetLastError();
-	}
 	wfree(lpString);
-	if (lpString != NULL)
-		lpString[nMaxCount - 1] = 0;
+	lpString[nMaxCount - 1] = 0;
+out:
 	SetLastError(err);
 	return ret;
 }
@@ -720,6 +716,21 @@ static __inline DWORD GetModuleFileNameExU(HANDLE hProcess, HMODULE hModule, cha
 		err = GetLastError();
 	}
 	wfree(lpFilename);
+	SetLastError(err);
+	return ret;
+}
+
+static __inline DWORD GetFinalPathNameByHandleU(HANDLE hFile, char* lpszFilePath, DWORD cchFilePath, DWORD dwFlags)
+{
+	DWORD ret = 0, err = ERROR_INVALID_DATA;
+	walloc(lpszFilePath, cchFilePath);
+	ret = GetFinalPathNameByHandleW(hFile, wlpszFilePath, cchFilePath, dwFlags);
+	err = GetLastError();
+	if ((ret != 0)
+		&& ((ret = wchar_to_utf8_no_alloc(wlpszFilePath, lpszFilePath, cchFilePath)) == 0)) {
+		err = GetLastError();
+	}
+	wfree(lpszFilePath);
 	SetLastError(err);
 	return ret;
 }

@@ -4,7 +4,7 @@
  *
  * Modified from Process Hacker:
  *   https://github.com/processhacker2/processhacker2/
- * Copyright © 2017-2021 Pete Batard <pete@akeo.ie>
+ * Copyright © 2017-2023 Pete Batard <pete@akeo.ie>
  * Copyright © 2017 dmex
  * Copyright © 2009-2016 wj32
  *
@@ -159,6 +159,9 @@ static NTSTATUS PhDestroyHeap(VOID)
  */
 static PVOID PhAllocate(SIZE_T Size)
 {
+	if (PhHeapHandle == NULL)
+		return NULL;
+
 	PF_INIT(RtlAllocateHeap, Ntdll);
 	if (pfRtlAllocateHeap == NULL)
 		return NULL;
@@ -174,8 +177,10 @@ static PVOID PhAllocate(SIZE_T Size)
  */
 static VOID PhFree(PVOID Memory)
 {
-	PF_INIT(RtlFreeHeap, Ntdll);
+	if (PhHeapHandle == NULL)
+		return;
 
+	PF_INIT(RtlFreeHeap, Ntdll);
 	if (pfRtlFreeHeap != NULL)
 		pfRtlFreeHeap(PhHeapHandle, 0, Memory);
 }
@@ -468,8 +473,16 @@ static DWORD WINAPI SearchProcessThread(LPVOID param)
 
 	for (i = 0; ; i++) {
 		ULONG attempts = 8;
-		PSYSTEM_HANDLE_TABLE_ENTRY_INFO_EX handleInfo =
-			(i < handles->NumberOfHandles) ? &handles->Handles[i] : NULL;
+		PSYSTEM_HANDLE_TABLE_ENTRY_INFO_EX handleInfo = NULL;
+
+		// We are seeing reports of application crashes due to access
+		// violation exceptions here, so, since this is not critical code,
+		// we add an exception handler to ignore them.
+		TRY_AND_HANDLE(
+			EXCEPTION_ACCESS_VIOLATION,
+			{ handleInfo = (i < handles->NumberOfHandles) ? &handles->Handles[i] : NULL; },
+			{ continue; }
+		);
 
 		if ((dupHandle != NULL) && (processHandle != NtCurrentProcess())) {
 			pfNtClose(dupHandle);
@@ -478,7 +491,11 @@ static DWORD WINAPI SearchProcessThread(LPVOID param)
 
 		// Update the current handle's process PID and compare against last
 		// Note: Be careful about not trying to overflow our list!
-		pid[cur_pid] = (handleInfo != NULL) ? handleInfo->UniqueProcessId : -1;
+		TRY_AND_HANDLE(
+			EXCEPTION_ACCESS_VIOLATION,
+			{ pid[cur_pid] = (handleInfo != NULL) ? handleInfo->UniqueProcessId : -1; },
+			{ continue; }
+		);
 
 		if (pid[0] != pid[1]) {
 			cur_pid = (cur_pid + 1) % 2;
@@ -486,7 +503,8 @@ static DWORD WINAPI SearchProcessThread(LPVOID param)
 			// If we're switching process and found a match, print it
 			if (bFound) {
 				static_sprintf (tmp, "● [%06u] %s (%s)", (uint32_t)pid[cur_pid], cmdline, access_rights_str[access_rights & 0x7]);
-				vuprintf(tmp);
+				// tmp may contain a '%' so don't feed it as a naked format string
+				vuprintf("%s", tmp);
 				StrArrayAdd(&BlockingProcess, tmp, TRUE);
 				bFound = FALSE;
 				access_rights = 0;
@@ -720,7 +738,7 @@ BOOL SearchProcessAlt(char* HandleName)
 		bFound = TRUE;
 		uprintf("WARNING: The following process(es) or service(s) are accessing %s:", HandleName);
 		for (i = 0; i < info->NumberOfProcessIdsInList; i++) {
-			uprintf("o Process with PID %ld", info->ProcessIdList[i]);
+			uprintf("o Process with PID %llu", (uint64_t)info->ProcessIdList[i]);
 		}
 	}
 
